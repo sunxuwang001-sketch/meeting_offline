@@ -1,6 +1,6 @@
 {
   "name": "meeting-offline",
-  "version": "1.0.0-beta.3",
+  "version": "1.0.0-beta.4",
   "description": "把会议录音整理成简洁的会议纪要（主题、时间、参会人、核心要点、主要 Todo），交付可编辑 HTML 与 PNG；说话人由你确认，角色与术语在本机持续积累。",
   "author": {
     "name": "sunxuwang001-sketch",

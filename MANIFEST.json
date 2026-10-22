@@ -1,6 +1,6 @@
 {
   "format": "meeting-offline-portable-v1",
-  "version": "1.0.0-beta.3",
+  "version": "1.0.0-beta.4",
   "device_scoped": true,
   "contains_personal_data": false,
   "files": {
@@ -46,7 +46,7 @@
     "skills/meeting-offline/scripts/transcribe_local.py": "6504d93e2999f85d528ab75cbe950634747a8a2408d339d5bf871959291cfc70",
     "skills/meeting-offline/scripts/transcribe_qwen.py": "b006313777f0f3f2d06b22edea715c39c416c4390f5345ba2e0b04e91f532abc",
     "skills/meeting-offline/scripts/voiceprint.py": "18769d751da3c037b2901ebc15bc427fde44d3fbd1cc7d9a9a020fd75df39b5a",
-    "skills/meeting-offline/scripts/workspace.py": "ead6e37aefeb6d8394dfd171d11f4996db969ff331bea28c1c4eb7a556ba49bb",
+    "skills/meeting-offline/scripts/workspace.py": "d36bf877eae698a7b7c15108d046f50e9e09f9a7b915f3bc7c555e46e285464b",
     "skills/meeting-offline/tests/audio_fixtures.py": "57dded9a9a421c4e7a031470a01efe6a86fb6ae8d15db869130dbb4baf88be03",
     "skills/meeting-offline/tests/test_archive_consistency.py": "798ba9ae60d294ed174ce8fa082d52e17e99e341b9cd5512ae02f45df8bd4f6d",
     "skills/meeting-offline/tests/test_archive_meeting.py": "31157eb7f2cc329eeb64e20c1efb50aead17f7fabbac26272876d1248b20a050",
@@ -56,7 +56,7 @@
     "skills/meeting-offline/tests/test_audit.py": "c4a4b496499d64c7f5dd0a91ff5929eb314a217bf54a0cea72802a60c11c4ccd",
     "skills/meeting-offline/tests/test_device_isolation.py": "a071c2a8484a47e99d6f7b17c59f538d35168fec5b412a3ac374960f06d12369",
     "skills/meeting-offline/tests/test_find_recordings.py": "dbce0a0c105a684eb4c862a34bdfef22076344f24e46b2796e2b5e88fd6a4f4a",
-    "skills/meeting-offline/tests/test_identity_review_followup.py": "a2a7b14b967f873f01acf8bf510f508cd473877ffe4c4d3a5cdafdfae46a5614",
+    "skills/meeting-offline/tests/test_identity_review_followup.py": "4e9f10c29d657c77d9f2ccbea3f238106aa1bfd69993adb2b67b3c2d2762d767",
     "skills/meeting-offline/tests/test_identity_transactions.py": "9a0bcf126adb34c3f49dae40e115bc7a533fe8dd45b55997ac387afd1d0d7868",
     "skills/meeting-offline/tests/test_inbox.py": "b13ee5a3c11fcf8842d77e5578dd962e2c280a6fa843410412fecafaf8eddc1a",
     "skills/meeting-offline/tests/test_insights.py": "a06a9daa32b71b6257c27ebeab90b21b80b586c4b99236f3a6e95b0b0938d514",
