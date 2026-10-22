@@ -24,18 +24,21 @@ class VoiceprintReviewUI(unittest.TestCase):
         self.assertIn("consent.className='confirm-identity'", self.html)
         # No preselection, timeout, or render event counts as consent.
         self.assertNotIn('consent.checked=true', self.html)
-        self.assertIn("if(!speaker.role_confirmed){const confirmation", self.html)
+        self.assertNotIn("if(!speaker.role_confirmed){const confirmation", self.html)
 
     @unittest.skipUnless(shutil.which('node'), 'optional Node is unavailable')
     def test_pure_save_guard_executes(self):
         function = re.search(r'function shouldSaveRole\(card\)\{[^\n]+\}', self.html).group(0)
         js = function + '''
 const assert=require('assert');
-const card=tick=>({querySelector:()=>tick});
+const card=(tick,was='false',old='a',value='a')=>({dataset:{wasConfirmed:was,originalRole:old},querySelector:q=>q==='.role-select'?{value}:tick});
 assert.strictEqual(shouldSaveRole(card({checked:false})),false);
 assert.strictEqual(shouldSaveRole(card({checked:true})),true);
-assert.strictEqual(shouldSaveRole(card(null)),true);
+assert.strictEqual(shouldSaveRole(card(null)),false);
 assert.strictEqual(shouldSaveRole(card({checked:'true'})),false);
+assert.strictEqual(shouldSaveRole(card({checked:false},'true')),false);
+assert.strictEqual(shouldSaveRole(card({checked:false},'true','a','b')),true);
+assert.strictEqual(shouldSaveRole(card({checked:false},'false','a','b')),false);
 '''
         subprocess.run([shutil.which('node'), '-e', js], check=True, capture_output=True)
 

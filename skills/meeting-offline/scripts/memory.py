@@ -13,6 +13,7 @@ Term entry JSON:
 Add active:false to retire an entry. Upserts retain prior versions in history.
 """
 import argparse
+from contextlib import nullcontext
 from file_lock import locked_file
 import device_context
 import json
@@ -48,11 +49,15 @@ def validate_entry(kind, entry):
     for field in required:
         if not isinstance(entry.get(field), str) or not entry[field].strip():
             raise ValueError('Missing nonempty string: ' + field)
+    if kind == 'role' and 'role_title' in entry and not isinstance(entry['role_title'], str):
+        raise ValueError('role_title must be a string.')
     if kind == 'role' and entry.get('entity_type') not in ('person', 'role'):
         raise ValueError('Role entity_type must be person or role.')
     for field in ('aliases', 'responsibilities', 'distinctive_signals'):
         if field in entry and (not isinstance(entry[field], list) or any(not isinstance(s, str) for s in entry[field])):
             raise ValueError(field + ' must be a list of strings.')
+    if 'revision' in entry and (type(entry['revision']) is not int or entry['revision'] < 1):
+        raise ValueError('revision must be a positive integer.')
     if 'active' in entry and type(entry['active']) is not bool:
         raise ValueError('active must be boolean.')
 
@@ -70,6 +75,35 @@ def atomic_write(path, data):
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def upsert_confirmed(path, kind, entry, *, _lock_held=False):
+    """Shared versioned writer; caller must establish explicit user confirmation.
+
+    _lock_held is for workspace transactions holding the same memory lock.
+    """
+    path = Path(path)
+    validate_entry(kind, entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with nullcontext() if _lock_held else locked_file(str(path) + '.lock'):
+        data = read_store(path)
+        bucket = kind + 's'
+        prior = next((e for e in data[bucket] if e['id'] == entry['id']), None)
+        now = datetime.now(timezone.utc).isoformat()
+        if prior:
+            if 'revision' in prior and (type(prior['revision']) is not int or prior['revision'] < 1):
+                raise ValueError('revision must be a positive integer.')
+            data['history'].append({'kind': kind, 'replaced_at': now, 'previous': deepcopy(prior)})
+            # Preserve established aliases and other fields unless explicitly replaced.
+            new_entry = {**prior, **entry}
+        else:
+            new_entry = dict(entry)
+        new_entry.update({'confirmed_by_user': True, 'updated_at': now,
+                          'created_at': prior.get('created_at', now) if prior else now,
+                          'revision': prior.get('revision', 1) + 1 if prior else 1})
+        new_entry.setdefault('active', True)
+        data[bucket] = [e for e in data[bucket] if e['id'] != entry['id']] + [new_entry]
+        atomic_write(path, data)
 
 
 def main():
@@ -108,21 +142,7 @@ def main():
                     atomic_write(path, data)
                 print('Local memory ready: ' + str(path))
                 return
-            bucket = args.kind + 's'
-            prior = next((e for e in data[bucket] if e['id'] == entry['id']), None)
-            now = datetime.now(timezone.utc).isoformat()
-            if prior:
-                data['history'].append({'kind': args.kind, 'replaced_at': now, 'previous': deepcopy(prior)})
-                # Preserve established aliases and other fields unless explicitly replaced.
-                new_entry = {**prior, **entry}
-            else:
-                new_entry = dict(entry)
-            new_entry.update({'confirmed_by_user': True, 'updated_at': now,
-                              'created_at': prior['created_at'] if prior else now,
-                              'revision': prior.get('revision', 1) + 1 if prior else 1})
-            new_entry.setdefault('active', True)
-            data[bucket] = [e for e in data[bucket] if e['id'] != entry['id']] + [new_entry]
-            atomic_write(path, data)
+            upsert_confirmed(path, args.kind, entry, _lock_held=True)
             print('Saved confirmed ' + args.kind + ': ' + entry['id'])
     except (ValueError, OSError, KeyError) as exc:
         parser.exit(2, str(exc) + '\n')

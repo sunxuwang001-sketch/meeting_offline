@@ -60,6 +60,8 @@ def load_vocabulary(path, error):
 def check_result(result, config, error):
     if not isinstance(result, dict) or result.get('model') != config['model']:
         raise error('转写结果的模型和本次任务不一致。')
+    if result.get('route', config['route']) != config['route']:
+        raise error('转写结果的转写路线和本次任务不一致。')
     duration = result.get('duration_seconds')
     if type(duration) not in (int, float) or not math.isfinite(duration) or abs(duration - config['duration_seconds']) > 1:
         raise error('转写结果的时长和这段录音不一致，可能不是同一段录音。')
@@ -67,12 +69,42 @@ def check_result(result, config, error):
     if not isinstance(segments, list) or not segments:
         raise error('没有得到带时间戳的转写结果；原始返回内容已保留在任务目录。')
     for segment in segments:
+        if not isinstance(segment, dict):
+            raise error('转写结果里有无效片段；原始返回内容已保留在任务目录。')
         start, end = segment.get('start_ms'), segment.get('end_ms')
         if (type(start) not in (int, float) or type(end) not in (int, float)
                 or not math.isfinite(start) or not math.isfinite(end)
                 or not 0 <= start <= end <= duration * 1000 + 2000
                 or not isinstance(segment.get('text'), str)):
             raise error('转写结果里有时间戳异常的片段；原始返回内容已保留在任务目录。')
+
+
+def check_checkpoint_task(task, manifest, error):
+    """A transcript alone cannot prove that this job completed successfully."""
+    output = task.get('output') if isinstance(task, dict) else None
+    if not isinstance(output, dict) or output.get('task_status') != 'SUCCEEDED':
+        raise error('本机任务检查点不是成功结果。')
+    # Older saved responses may omit task_id; never accept a contradictory ID.
+    if output.get('task_id') is not None and output['task_id'] != manifest.get('task_id'):
+        raise error('本机任务检查点属于另一个云端任务。')
+    results = output.get('results')
+    if (not isinstance(results, list) or len(results) != 1
+            or not isinstance(results[0], dict)
+            or results[0].get('subtask_status') != 'SUCCEEDED'
+            or not results[0].get('transcription_url')):
+        raise error('本机任务检查点没有唯一的成功结果。')
+
+
+def quarantine_result(path):
+    """Keep damaged evidence, without overwriting previous quarantines."""
+    fd, name = tempfile.mkstemp(prefix='result.corrupt-', suffix='.json', dir=str(path.parent))
+    os.close(fd)
+    try:
+        os.replace(path, name)
+    except OSError:
+        os.unlink(name)
+        raise
+    return Path(name).name
 
 
 def channel_preflight(audio, confirmed=False):
@@ -160,26 +192,62 @@ def execute(args, api):
         device_context.require_device(manifest.get('device_id'), directory)
         manifest.setdefault('device_id', device_context.device_id())
         def stage(value, **extra):
+            if value == 'completed':
+                manifest.pop('result_cache_invalid', None)
             manifest.update(status=value, updated_at=now(), **extra)
             save_json(manifest_path, manifest)
             print('[Qwen] ' + value, file=sys.stderr, flush=True)
         result_path = directory / 'result.json'
-        if manifest['status'] == 'completed' and result_path.exists():
-            result = json.loads(result_path.read_text(encoding='utf-8'))
-            check_result(result, config, api.TranscriptionError)
-            warn_legacy_channels(manifest, config)
-            print('[Qwen] 复用本机已完成的转写结果，未联网、未读取密钥', file=sys.stderr)
-            return result
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding='utf-8'))
+                check_result(result, config, api.TranscriptionError)
+            except (ValueError, TypeError, AttributeError, api.TranscriptionError):
+                # Persist the no-resubmission guard before moving the evidence.
+                manifest['result_cache_invalid'] = True
+                save_json(manifest_path, manifest)
+                quarantined = quarantine_result(result_path)
+                print('[Qwen] 无效的最终缓存已隔离为 ' + quarantined + '；仅尝试本机恢复、续取已有任务或显式导入。', file=sys.stderr)
+            else:
+                if manifest['status'] != 'completed' or manifest.get('result_cache_invalid'):
+                    stage('completed')
+                warn_legacy_channels(manifest, config)
+                print('[Qwen] 复用本机已完成的转写结果，未联网、未读取密钥', file=sys.stderr)
+                return result
         if args.import_result:
             if config['vocabulary']:
                 raise api.TranscriptionError('导入的已有结果不能标记为“使用了热词”；去掉 --hotwords 再导入。')
-            if manifest.get('task_id'):
+            if manifest.get('task_id') and manifest['status'] not in ('completed', 'result_ready'):
                 raise api.TranscriptionError('这段录音已有进行中的云端任务，不能用导入结果替换。')
-            result = json.loads(Path(args.import_result).expanduser().read_text(encoding='utf-8'))
-            check_result(result, config, api.TranscriptionError)
+            try:
+                result = json.loads(Path(args.import_result).expanduser().read_text(encoding='utf-8'))
+                check_result(result, config, api.TranscriptionError)
+            except (OSError, ValueError, TypeError, AttributeError, api.TranscriptionError) as exc:
+                raise api.TranscriptionError('导入结果无效或与本次任务不符；未使用其他来源，也未重新提交。') from exc
             save_json(result_path, result)
             stage('completed', origin='imported_existing_transcript', imported_at=now())
             return result
+        # Imported results have a different provenance. Never silently replace them
+        # with stale provider checkpoints left in the same directory.
+        if manifest.get('origin') == 'imported_existing_transcript':
+            raise api.TranscriptionError('导入结果缓存缺失或无效，请用 --import-result 显式重新导入；不会改用云端检查点或重新提交。')
+        response_path = directory / 'response-normalized.json'
+        if config['route'] == 'direct_base64' and response_path.exists():
+            try:
+                recovered = json.loads(response_path.read_text(encoding='utf-8'))
+                check_result(recovered, config, api.TranscriptionError)
+                if recovered.get('route') != config['route']:
+                    raise api.TranscriptionError('本机响应检查点的转写路线不一致。')
+            except (OSError, ValueError, TypeError, AttributeError, api.TranscriptionError) as exc:
+                raise api.TranscriptionError('本机响应检查点无效，无法安全恢复；不会重新提交。请检查任务目录或显式导入已有结果。') from exc
+            save_json(result_path, recovered)
+            stage('completed')
+            print('[Qwen] 从本机响应检查点恢复，未联网、未读取密钥', file=sys.stderr)
+            return recovered
+        # Only known, unfinished result retrieval may resume through read-only GETs.
+        # A damaged cache must never make a job eligible for a new paid submission.
+        can_refetch = (config['route'] == 'temporary_storage' and bool(manifest.get('task_id'))
+                       and manifest['status'] in ('result_ready', 'processing'))
         raw_path, task_path = directory / 'transcript-raw.json', directory / 'task-response.json'
         if (config['route'] == 'temporary_storage' and manifest.get('task_id')
                 and raw_path.exists() and task_path.exists()):
@@ -187,15 +255,20 @@ def execute(args, api):
             try:
                 raw = json.loads(raw_path.read_text(encoding='utf-8'))
                 task = json.loads(task_path.read_text(encoding='utf-8'))
+                check_checkpoint_task(task, manifest, api.TranscriptionError)
                 recovered = api.normalize_long(raw, task, config['duration_seconds'])
                 check_result(recovered, config, api.TranscriptionError)
-            except (OSError, ValueError, TypeError, AttributeError, api.TranscriptionError):
+            except (OSError, ValueError, TypeError, AttributeError, api.TranscriptionError) as exc:
+                if manifest['status'] == 'completed' or (manifest.get('result_cache_invalid') and not can_refetch):
+                    raise api.TranscriptionError('已有任务的本机检查点无效，无法安全恢复；不会重新提交。请检查任务目录或显式导入已有结果。') from exc
                 print('[Qwen] 已保存的原始结果无效，将只重新获取现有任务的结果，不重新上传或提交。', file=sys.stderr)
             else:
                 save_json(result_path, recovered)
                 stage('completed')
                 print('[Qwen] 从本机原始结果恢复，未联网、未读取密钥', file=sys.stderr)
                 return recovered
+        if manifest['status'] == 'completed' or (manifest.get('result_cache_invalid') and not can_refetch):
+            raise api.TranscriptionError('已有任务的结果缓存缺失或无效，且没有可验证的本机检查点；不会重新提交。请显式导入已有结果。')
         if manifest['status'] in ('submitting', 'uncertain_submission'):
             raise api.TranscriptionError('上次提交的结果不确定（可能已在阿里云处理并计费），为避免重复扣费不会自动重试。请先在百炼控制台确认，再用新的 --job-dir 重新提交。')
         if manifest['status'] in ('uploading', 'upload_failed') and not args.retry_upload:
@@ -264,11 +337,16 @@ def execute(args, api):
                 raise
             stage('submitted', task_id=task_id)
         if manifest['status'] == 'result_ready' and task_path.exists():
-            task = json.loads(task_path.read_text(encoding='utf-8'))
+            try:
+                task = json.loads(task_path.read_text(encoding='utf-8'))
+                check_checkpoint_task(task, manifest, api.TranscriptionError)
+            except (OSError, ValueError, TypeError, AttributeError, api.TranscriptionError) as exc:
+                raise api.TranscriptionError('本机任务检查点无效；不会使用来源不明的结果地址或重新提交。') from exc
         else:
             stage('processing')
             # A timeout retains task_id; the next run resumes polling, never uploading.
             task = api.poll_task(manifest['task_id'], key, config['base_url'], args.poll_seconds, args.timeout_seconds)
+            check_checkpoint_task(task, manifest, api.TranscriptionError)
             save_json(task_path, task)
             stage('result_ready')
         results = task.get('output', {}).get('results', [])

@@ -80,7 +80,7 @@ class VoiceprintWorkflowTests(unittest.TestCase):
         self.assertEqual(state['revision'], before['revision'] + 1)
         self.assertEqual((self.root / 'analysis.json').read_bytes(), analysis_before)
         self.assertEqual(state['sources'], before['sources'])
-        self.assertEqual(enroll.call_args.args[2], ['m-A'])
+        enroll.assert_not_called()  # Voice is disabled: explicit identity still saves.
         self.assertTrue(any(p['name'] == '确认姓名' for p in w.read(Path(w.memory_path(state)))['roles']))
 
     def test_import_rejects_foreign_stale_unknown_and_malicious_payloads_atomically(self):
@@ -247,7 +247,7 @@ class VoiceprintWorkflowTests(unittest.TestCase):
         with mock.patch.object(voiceprint, 'status', return_value={'enabled': True}), mock.patch.object(voiceprint, 'speaker_vectors', return_value=({}, {})) as vectors:
             w.save_roles(self.root, [{'key': 'm-UNASSIGNED', 'name': '林悦', 'entity_type': 'person',
                                      'confirm_single_speaker': True}], self.revision())
-        self.assertEqual(vectors.call_args.args[2], set())
+        vectors.assert_not_called()
         analysis = self.analysis()
         analysis['sources']['m']['actions'][0]['owner'] = 'm-UNASSIGNED'
         w.set_analysis(self.root, analysis, self.revision())

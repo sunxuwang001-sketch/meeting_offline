@@ -114,8 +114,9 @@ ISO = re.compile(r'(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*[日�
 DATE = re.compile(r'(\d{1,2}|[一二三四五六七八九十]{1,3})\s*月\s*(\d{1,2}|[一二三四五六七八九十]{1,3})\s*[日号]')
 DAY = re.compile(r'(\d{1,2}|[一二三四五六七八九十]{1,3})\s*[日号](?![子常期])')
 WEEK = re.compile(r'(下下|下|这|本|上)?\s*(?:周|星期|礼拜)\s*([一二三四五六日天])')
-CLOCK = re.compile(r'(\d{1,2})\s*[:：]\s*(\d{2})')
-SPOKEN_TIME = re.compile(r'(上午|下午|晚上|早上|中午|凌晨|傍晚)?\s*(\d{1,2}|[一二两三四五六七八九十]{1,3})\s*点\s*(半|(\d{1,2}|[一二三四五六七八九十]{1,3})\s*分)?')
+PERIOD = r'(上午|下午|晚上|早上|中午|凌晨|傍晚)'
+CLOCK = re.compile(PERIOD + r'?\s*(\d{1,2})\s*[:：]\s*(\d{2})(?!\d)')
+SPOKEN_TIME = re.compile(r'(上午|下午|晚上|早上|中午|凌晨|傍晚)?\s*(\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*点\s*(半|(\d{1,2}|[一二三四五六七八九十]{1,3})\s*分)?')
 PERCENT = re.compile(r'(\d+(?:\.\d+)?)\s*%|百分之([零〇一二两三四五六七八九十百点]+|\d+(?:\.\d+)?)|([一二三四五六七八九]|\d)\s*成(?![本功员绩为交])')
 ARABIC = re.compile(r'(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s*(万|亿|千|k|K|w|W)?')
 YEAR = re.compile(r'\s*年')
@@ -133,6 +134,29 @@ def year_or_number(value, after):
     if YEAR.match(after) and 1900 <= value <= 2100 and value == int(value):
         return ('year', number(value))
     return ('number', number(value))
+
+
+def time_fact(hour, minute, period=None, spoken=False):
+    """Keep explicit 24-hour times distinct; unqualified spoken 1–12 is ambiguous.
+
+    Chinese noon 12 is 12:00; night/dawn 12 is midnight. 24:00 is
+    end-of-day, not silently the same as 00:00 on the cited day. Colon
+    notation without a period is interpreted as written on a 24-hour clock.
+    """
+    if hour is None or minute is None or not 0 <= minute < 60 or not 0 <= hour <= 24:
+        return None
+    if hour == 24 and minute:
+        return None
+    if period and hour <= 12:
+        if period in ('下午', '中午', '傍晚') and hour < 12:
+            hour += 12
+        elif period == '晚上':
+            # Colloquial 晚上一到四点 refers to the hours after midnight.
+            hour = hour if hour <= 4 else hour + 12 if hour < 12 else 0
+        elif period == '凌晨' and hour == 12:
+            hour = 0
+    kind = 'time_ambiguous' if spoken and not period and 1 <= hour <= 12 else 'time'
+    return (kind, f'{hour}:{minute:02d}')
 
 
 def facts(text):
@@ -156,17 +180,34 @@ def facts(text):
         found.add(('week', f'{prefix}-{WEEKDAY[m.group(2)]}'))
     rest = WEEK.sub(' ', rest)
     for m in CLOCK.finditer(rest):
-        found.add(('time', f'{int(m.group(1)) % 12}:{m.group(2)}'))
+        fact = time_fact(int(m.group(2)), int(m.group(3)), m.group(1))
+        if fact:
+            found.add(fact)
     rest = CLOCK.sub(' ', rest)
 
-    def spoken(m):  # 下午三点、三点半: a time; a bare 三点 stays a number (三点建议)
-        if not (m.group(1) or m.group(3)):
+    previous_time = None
+
+    def spoken(m):  # A bare 三点建议 is numeric; 三点交付 has a time context.
+        nonlocal previous_time
+        if rest[:m.start()].rstrip().endswith('第'):
+            return m.group(0)
+        period = m.group(1)
+        if (not period and previous_time is not None
+                and re.fullmatch(r'\s*(?:到|至|[-–—~～])\s*', rest[previous_time[0]:m.start()])):
+            period = previous_time[1]
+        contextual = re.match(
+            r'(?:前(?![提景言期程途线沿端])|后(?![续果勤台备面方])|左右|'
+            r'整(?![改理体合顿治修装编])|准时|开始|结束|交付|提交|完成|开会|召开|到达|出发|上线|截止)',
+            rest[m.end():])
+        if not (period or m.group(3) or contextual or (as_int(m.group(2)) or 0) > 12):
             return m.group(0)
         hour = as_int(m.group(2))
         minute = 30 if m.group(3) == '半' else as_int(m.group(4)) if m.group(4) else 0
-        if hour is None or minute is None:
+        fact = time_fact(hour, minute, period, spoken=True)
+        if fact is None:
             return m.group(0)
-        found.add(('time', f'{hour % 12}:{minute:02d}'))
+        found.add(fact)
+        previous_time = (m.end(), period)
         return ' '
     rest = SPOKEN_TIME.sub(spoken, rest)
     for m in PERCENT.finditer(rest):
@@ -213,11 +254,12 @@ def supported(fact, evidence):
         return any(k == 'week' and v.endswith(value[4:]) and v.startswith('this') for k, v in evidence)
     if kind == 'year':  # the minutes may add the year of the meeting; a different year than the one said is not
         return not any(k == 'year' for k, _ in evidence)
-    if kind == 'time':  # 15:00 is backed by “三点”
+    if kind == 'time_ambiguous':  # Losing a period is not inventing one; the reverse needs review.
         hour, minute = value.split(':')
-        return minute == '00' and any(('number', str(h)) in evidence for h in (int(hour), int(hour) + 12))
-    if kind == 'number':  # 1.5万 and 15000 already compare equal; also a percent said as a number, or 三点 said as 15:00
-        return ('percent', value) in evidence or (value.isdigit() and ('time', f'{int(value) % 12}:00') in evidence)
+        return any(k == 'time' and int(v.split(':')[0]) % 12 == int(hour) % 12
+                   and v.split(':')[1] == minute for k, v in evidence)
+    if kind == 'number':
+        return ('percent', value) in evidence
     return False
 
 
@@ -268,7 +310,7 @@ def decisive(text):
     return bool(AGREED.search(text))
 
 
-LABEL = {'number': '数字或金额', 'percent': '比例', 'date': '日期', 'day': '日期', 'week': '星期', 'when': '时间说法', 'time': '时间', 'year': '年份'}
+LABEL = {'number': '数字或金额', 'percent': '比例', 'date': '日期', 'day': '日期', 'week': '星期', 'when': '时间说法', 'time': '时间', 'time_ambiguous': '未注明时段的时间', 'year': '年份'}
 DAYS = '一二三四五六日'
 
 
@@ -287,9 +329,9 @@ def pretty(fact):
     return value
 
 
-def issue(sid, where, kind, claim, detail, refs):
+def issue(sid, where, kind, claim, detail, refs, evidence_texts=()):
     # the text and its evidence are part of the id: a confirmation never carries over to different wording
-    key = hashlib.sha256(json.dumps([sid, where, kind, detail, claim, refs], ensure_ascii=False).encode()).hexdigest()[:12]
+    key = hashlib.sha256(json.dumps(['evidence-v2', sid, where, kind, detail, claim, refs, list(evidence_texts)], ensure_ascii=False).encode()).hexdigest()[:12]
     return {'id': key, 'source_id': sid, 'where': where, 'kind': kind, 'claim': claim, 'detail': detail, 'evidence': refs}
 
 
@@ -299,22 +341,22 @@ def check_claim(sid, where, claim, refs, texts, names=(), allowed_names=(), stat
     evidence = set().union(*(facts(t) for t in said)) if said else set()
     for fact in sorted(facts(claim)):
         if not supported(fact, evidence):
-            problems.append({**issue(sid, where, 'fact', claim, f'{LABEL[fact[0]]}“{pretty(fact)}”在引用原话里找不到', refs),
+            problems.append({**issue(sid, where, 'fact', claim, f'{LABEL[fact[0]]}“{pretty(fact)}”在引用原话里找不到', refs, said),
                              'fact': list(fact), 'evidence_texts': said})
     joined = '\n'.join(said)
     for name in names:
         if name and name in claim and name not in joined and name not in allowed_names:
-            problems.append(issue(sid, where, 'name', claim, f'人名“{name}”不在引用原话里，也不是这条的发言人', refs))
+            problems.append(issue(sid, where, 'name', claim, f'人名“{name}”不在引用原话里，也不是这条的发言人', refs, said))
     said_no, claim_no = {p for t in said for p in negations(t)}, set(negations(claim))
     for what, before in sorted(said_no):  # 原话“不打折”，纪要写成“打折”
         if mentions(claim, what, before) and not any(c[0] == what[0] for c, _ in claim_no):
-            problems.append(issue(sid, where, 'negation', claim, f'原话是否定的“…{what}”（不/没/未），纪要里写成了肯定', refs))
+            problems.append(issue(sid, where, 'negation', claim, f'原话是否定的“…{what}”（不/没/未），纪要里写成了肯定', refs, said))
     for what, before in sorted(claim_no):  # 纪要“不招人”，原话是“招两个人”
         if not any(c[0] == what[0] for c, _ in said_no) and (
                 mentions(joined, what, before) or (not said_no and mentions(joined, what[0], before))):
-            problems.append(issue(sid, where, 'negation', claim, f'纪要说“不/没{what}”，引用原话里没有这个否定', refs))
+            problems.append(issue(sid, where, 'negation', claim, f'纪要说“不/没{what}”，引用原话里没有这个否定', refs, said))
     if status == 'decided' and said and any(h in joined for h in HEDGE) and not decisive(joined):
-        problems.append(issue(sid, where, 'status', claim, '标为“已决定”，但原话是“考虑/建议/再看看”之类的说法', refs))
+        problems.append(issue(sid, where, 'status', claim, '标为“已决定”，但原话是“考虑/建议/再看看”之类的说法', refs, said))
     return problems
 
 
@@ -344,7 +386,8 @@ def audit(root):
         for n, point in enumerate(reader.get('points', [])):
             where = f'points[{n}]'
             if point.get('status') not in STATUS:
-                problems.append(issue(sid, where, 'status', point.get('title', ''), '要点没有标明状态（已决定 / 推进方向 / 建议 / 讨论中）', point.get('evidence', [])))
+                problems.append(issue(sid, where, 'status', point.get('title', ''), '要点没有标明状态（已决定 / 推进方向 / 建议 / 讨论中）', point.get('evidence', []),
+                                      [texts[i] for i in point.get('evidence', []) if 0 <= i < len(texts)]))
             allowed = [name_of(k) for k in point.get('attribution', [])]
             problems += check_claim(sid, where, point.get('title', '') + '：' + point.get('text', ''), point.get('evidence', []),
                                     texts, names, allowed, point.get('status'))

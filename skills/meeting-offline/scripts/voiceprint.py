@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from contextlib import ExitStack
 import hashlib
@@ -348,6 +349,22 @@ def confirmed_profiles(state):
     return {p['id']: p for p in memory.read_store(path)['roles'] if p.get('active', True) and p.get('confirmed_by_user') is True and p.get('confirmation')}
 
 
+def confirmed_library_snapshot(state):
+    """Readers share the memory→voice lock order with identity transactions.
+
+    Otherwise another meeting could persist a suggestion from an uncommitted
+    profile and sample that are subsequently rolled back.
+    """
+    store = Path(state.get('memory_store') or device_context.paths()['memory'])
+    path = location()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with locked_file(str(store) + '.lock'), locked_file(path.with_suffix('.lock')):
+        known = confirmed_profiles(state)
+        library = {pid: value for pid, value in read_library()['profiles'].items() if pid in known} if known else {}
+        return known, library
+
+
 def match_workspace(root, state=None):
     if state is None:
         import workspace
@@ -363,9 +380,8 @@ def match_workspace(root, state=None):
     device_context.require_device(state.get('device_id'))
     if not status()['enabled']:
         return {'enabled': False, 'matches': {}, 'reason': status()['reason']}
-    known = confirmed_profiles(state)
     try:
-        library = {pid: value for pid, value in read_library()['profiles'].items() if pid in known} if known else {}
+        known, library = confirmed_library_snapshot(state)
     except (ValueError, OSError) as error:
         for speaker in state['speakers']:
             if not speaker.get('role_confirmed') and speaker.get('role_source') == 'voice_match':
@@ -400,64 +416,148 @@ def match_workspace(root, state=None):
             'reason': 'matched' if matches else 'no_match'}
 
 
-def enroll_confirmed(root, state, speaker_keys):
-    """Only call from user-confirmation routes, after confirmed memory has been committed."""
+def sample_identity(root, speaker, source):
+    return hashlib.sha256(json.dumps([str(Path(root).resolve()), speaker['key'], source.get('audio_sha256'),
+                                      intervals(speaker)], sort_keys=True).encode()).hexdigest()
+
+
+class LibraryUnavailable(ValueError):
+    """An unreadable library is left untouched and cannot enroll or match."""
+
+
+def read_available_library():
+    try:
+        return read_library()
+    except (ValueError, OSError) as error:
+        raise LibraryUnavailable('声纹库无法读取或与本机模型不兼容；已保留原文件，本次不登记声纹。'
+                                 '请备份后在声纹设置中关闭并清除旧库，再按需重新启用、确认身份。原因：' + str(error)) from error
+
+
+class ReconciliationError(ValueError):
+    """A required removal failed; do not commit the new identity mapping."""
+
+
+def reconcile_samples(root, state, speaker_keys, *, _lock_held=False):
+    """Remove only changed mappings' obsolete contributions, without extracting audio.
+
+    This is deletion, not biometric enrollment: it must also work after consent is
+    disabled or the model is unavailable. The caller holds the workspace lock.
+    """
+    sources = {s['source_id']: s for s in state.get('sources', [])}
+    mappings = []
+    for speaker in state['speakers']:
+        if speaker['key'] not in speaker_keys:
+            continue
+        source = sources.get(speaker.get('source_id'), {})
+        pid = speaker.get('identity_group') if (speaker.get('role_confirmed') is True and
+              not speaker.get('accepted_unknown') and not unassigned(speaker)) else None
+        mappings.append((speaker, sample_identity(root, speaker, source), pid))
+    path = location()
+    if not mappings or not path.exists():
+        return
+    workspace_path = str(Path(root).resolve())
+    with nullcontext() if _lock_held else locked_file(path.with_suffix('.lock')):
+        data = read_available_library()
+        changed = False
+        for pid, record in list(data['profiles'].items()):
+            samples = record.get('sources', [])
+            def obsolete(sample):
+                return any(target != pid and (sample.get('sample_id') == sample_id or
+                           (sample.get('workspace') == workspace_path and
+                            sample.get('speaker_key') == speaker['key'] and
+                            sample.get('source_id') == speaker.get('source_id')))
+                           for speaker, sample_id, target in mappings)
+            removed = [sample for sample in samples if obsolete(sample)]
+            if not removed:
+                continue
+            changed = True
+            remaining = [sample for sample in samples if not obsolete(sample)]
+            count = record.get('count', len(samples)) - len(removed)
+            if count <= 0 and not remaining:
+                del data['profiles'][pid]
+                continue
+            # Rebuild fully attributed records. For legacy aggregates, subtract
+            # exact new contributions from their stored sum, not normalized center.
+            total = None
+            if count == len(remaining) and remaining and all('vector' in s for s in remaining):
+                total = [sum(s['vector'][i] for s in remaining)
+                         for i in range(len(remaining[0]['vector']))]
+            elif 'vector_sum' in record and all('vector' in s for s in removed):
+                total = [value - sum(s['vector'][i] for s in removed)
+                         for i, value in enumerate(record['vector_sum'])]
+            record.update(count=count, sources=remaining, updated_at=now())
+            record.pop('vector', None); record.pop('vector_sum', None)
+            if total is not None:
+                record['vector_sum'] = total
+                try:
+                    record['vector'] = normalize(total)
+                except ValueError:
+                    pass  # A cancelling sum is not a usable match center.
+            # If legacy contributions cannot be separated, retain other samples'
+            # metadata but never retain their contaminated match center.
+        if changed:
+            atomic_write(path, data)
+
+
+def enroll_confirmed(root, state, speaker_keys, *, _lock_held=False, _reconcile_keys=None):
+    """Call after explicit mapping saves, with ALL saved keys (including unknown)."""
     device_context.require_device(state.get('device_id'))
+    speaker_keys = set(speaker_keys)
+    try:
+        reconcile_samples(root, state, speaker_keys if _reconcile_keys is None else set(_reconcile_keys), _lock_held=_lock_held)
+    except LibraryUnavailable:
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        raise ReconciliationError('旧声纹贡献撤回失败，身份修改未保存。请检查声纹库目录的写权限和磁盘空间；'
+                                  '备份并修复声纹库后再保存，或在声纹设置中关闭并清除旧库。原因：' + str(error)) from error
     if not status()['enabled']:
         return {'enrolled': [], 'reason': 'disabled'}
+    read_available_library()  # Never extract against an unreadable or incompatible library.
     known = confirmed_profiles(state)
     eligible = {s['key']: s for s in state['speakers'] if s['key'] in speaker_keys and
                 s.get('role_confirmed') is True and not s.get('accepted_unknown') and not unassigned(s) and
                 s.get('identity_group') in known}
-    vectors, skipped = speaker_vectors(root, state, set(eligible))
+    vectors, skipped = speaker_vectors(root, state, set(eligible)) if eligible else ({}, {})
     if not vectors:
         return {'enrolled': [], 'skipped': skipped}
     path = location(); path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with locked_file(path.with_suffix('.lock')):
+    with nullcontext() if _lock_held else locked_file(path.with_suffix('.lock')):
         if not status()['enabled']:
             return {'enrolled': [], 'reason': 'disabled'}
-        data = read_library(); enrolled = []
+        data = read_available_library(); enrolled = []
         for key, vector in vectors.items():
             speaker = eligible[key]; pid = speaker['identity_group']
             source = next(s for s in state['sources'] if s['source_id'] == speaker['source_id'])
-            sample_id = hashlib.sha256(json.dumps([str(Path(root).resolve()), key, source.get('audio_sha256'),
-                                                  intervals(speaker)], sort_keys=True).encode()).hexdigest()
-            for previous_id, previous_record in list(data['profiles'].items()):
-                if previous_id == pid:
-                    continue
-                old_samples = previous_record.get('sources', [])
-                removed = [sample for sample in old_samples if sample.get('sample_id') == sample_id]
-                if not removed:
-                    continue
-                remaining = [sample for sample in old_samples if sample.get('sample_id') != sample_id]
-                if not remaining or any('vector' not in sample for sample in remaining):
-                    # Never keep a contaminated center when its contribution cannot be undone.
-                    del data['profiles'][previous_id]
-                else:
-                    center = [sum(sample['vector'][i] for sample in remaining)
-                              for i in range(len(remaining[0]['vector']))]
-                    previous_record.update(vector=normalize(center), vector_sum=center,
-                                           count=len(remaining), sources=remaining, updated_at=now())
+            sample_id = sample_identity(root, speaker, source)
             old = data['profiles'].get(pid, {}); samples = old.get('sources', [])
             if any(s.get('sample_id') == sample_id for s in samples):
                 continue
             vector = normalize(vector); n = old.get('count', 0)
             if n:
-                previous = normalize(old['vector'])
-                if len(previous) != len(vector):
+                if 'vector_sum' in old:
+                    total = old['vector_sum']
+                elif 'vector' in old:
+                    total = [v*n for v in normalize(old['vector'])]
+                else:
+                    skipped[key] = 'Legacy contributions cannot be separated; re-enrollment required.'
+                    continue
+                if len(total) != len(vector):
                     raise ValueError('Voice model dimension changed; forget the old profile before enrolling.')
-                # Store the sum, rather than repeatedly normalizing an arithmetic mean.
-                total = old.get('vector_sum', [v*n for v in previous])
                 total = [a+b for a, b in zip(total, vector)]
             else:
                 total = vector
             data['profiles'][pid] = {'profile_id': pid, 'vector': normalize(total), 'vector_sum': total,
                 'count': n+1, 'updated_at': now(), 'sources': samples + [{'sample_id': sample_id,
-                'meeting': Path(root).name, 'source_id': source['source_id'], 'speaker_key': key,
+                'workspace': str(Path(root).resolve()), 'meeting': Path(root).name,
+                'source_id': source['source_id'], 'speaker_key': key,
                 'confirmed_at': now(), 'vector': vector}]}
             enrolled.append(key)
         if enrolled:
-            atomic_write(path, data)
+            try:
+                atomic_write(path, data)
+            except OSError as error:
+                raise ReconciliationError('声纹库写入失败，身份修改未保存。请检查目录写权限和磁盘空间，'
+                                          '修复后重试；或在声纹设置中关闭并清除旧库。原因：' + str(error)) from error
     return {'enrolled': enrolled, 'skipped': skipped}
 
 

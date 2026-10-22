@@ -2,7 +2,7 @@
 """Local meeting workspace, role review, scoped corrections and reproducible exports."""
 from __future__ import annotations
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from copy import deepcopy
 from datetime import datetime, timezone
 from file_lock import locked_file
@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import uuid
@@ -197,6 +196,21 @@ def commit(root, state, change):
 
 
 
+def restore_bytes(backups):
+    """Restore exact snapshots independently of the failing JSON writer."""
+    for path, content in backups.items():
+        if content is None:
+            path.unlink(missing_ok=True)
+            continue
+        fd, temporary = tempfile.mkstemp(prefix='.rollback-', dir=str(path.parent))
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(content); handle.flush(); os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary): os.unlink(temporary)
+
+
 def commit_analysis(root, state, change, analysis):
     """Commit analysis and its state under the caller's workspace lock; roll back failed writes."""
     root = Path(root)
@@ -207,20 +221,7 @@ def commit_analysis(root, state, change, analysis):
         write(root / 'analysis.json', analysis)
         return commit(root, state, change)
     except Exception:
-        for path, content in backups.items():
-            if content is None:
-                path.unlink(missing_ok=True)
-            else:
-                # Restore exact bytes independently of the failing JSON writer.
-                fd, temporary = tempfile.mkstemp(prefix='.rollback-', dir=str(path.parent))
-                try:
-                    with os.fdopen(fd, 'wb') as handle:
-                        handle.write(content)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, path)
-                finally:
-                    if os.path.exists(temporary): os.unlink(temporary)
+        restore_bytes(backups)
         raise
 
 
@@ -253,93 +254,142 @@ def check_revision(state, expected):
         raise ValueError('页面内容已更新，请刷新后再保存。')
 
 
-def confirmed_memory_upsert(store, kind, entry):
-    # Use the same locked, versioned writer as the skill CLI.
-    with tempfile.TemporaryDirectory(prefix='meeting-confirmed-') as tmp:
-        path = Path(tmp) / 'entry.json'; write(path, entry)
-        subprocess.run([sys.executable, str(Path(__file__).with_name('memory.py')), '--store', str(store),
-                        'upsert', '--kind', kind, '--entry', str(path), '--user-confirmed'],
-                       check=True, capture_output=True, text=True)
+def confirmed_memory_upsert(store, kind, entry, *, _lock_held=False):
+    # The CLI and workspace share one locked, versioned writer.
+    memory.upsert_confirmed(store, kind, entry, _lock_held=_lock_held)
+
+
+@contextmanager
+def identity_store_transaction(state):
+    """Hold shared-store locks through workspace commit and rollback failed writes.
+
+    Lock order: workspace, memory, voiceprint. Never restore an unlocked whole
+    store: another meeting may be updating a different profile concurrently.
+    """
+    import voiceprint
+    store, library = memory_path(state), voiceprint.location()
+    store.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as locks:
+        locks.enter_context(locked_file(str(store) + '.lock'))
+        # Disabled installations with no library must remain usable without
+        # creating the optional biometric store (or its parent directory).
+        voice_active = library.exists() or voiceprint.status()['enabled']
+        paths = [store]
+        if voice_active:
+            library.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            locks.enter_context(locked_file(library.with_suffix('.lock')))
+            paths.append(library)
+        backups = {path: path.read_bytes() if path.exists() else None for path in paths}
+        try:
+            yield voice_active
+        except Exception:
+            restore_bytes(backups)
+            raise
 
 
 def save_roles(root, mappings, expected, via='page'):
     root = Path(root)
     with locked(root):
         state = read(root / 'state.json'); check_revision(state, expected)
-        known = memory.read_store(memory_path(state))
-        profiles = {p['id']: p for p in known['roles'] if p.get('active', True)}
-        speakers = {s['key']: s for s in state['speakers']}
-        if not isinstance(mappings, list) or any(not isinstance(m, dict) or not isinstance(m.get('key'), str) for m in mappings) \
-                or len({m['key'] for m in mappings}) != len(mappings):
-            raise ValueError('Invalid or duplicate speaker mappings.')
-        old_speakers = deepcopy(speakers)
-        resolved = []
-        new_profiles = []
-        for mapping in mappings:
-            if mapping['key'] not in speakers:
-                raise ValueError('Unknown speaker.')
-            if mapping.get('keep_unknown'):
-                resolved.append((mapping['key'], None)); continue
-            if speakers[mapping['key']].get('diarization_unassigned') and mapping.get('confirm_single_speaker') is not True:
-                # Speech the separation could not attribute may mix several people.
-                raise ValueError('“说话人未分离”的部分可能混有多人的发言，不能直接认领成一个人。'
-                                 '确定这部分都是同一个人说的，请在复核页面勾选“这部分都是同一个人说的”'
-                                 '（在对话里确认的，映射里加 confirm_single_speaker）；否则选“明确保留身份未确认”。')
-            profile_id = mapping.get('profile_id')
-            if profile_id:
-                if profile_id not in profiles:
-                    raise ValueError('Unknown/inactive profile.')
-                profile = profiles[profile_id]
-            else:
-                name = str(mapping.get('name', '')).strip()
-                role = str(mapping.get('role_title', '')).strip()
-                scope = str(mapping.get('scope', '')).strip() or '本次会议，组织待补'
-                if not name or len(name) > 100 or len(role) > 200:
-                    raise ValueError('请填写姓名或角色称呼。')
-                entity_type = mapping.get('entity_type', 'role')
-                if entity_type not in ('person', 'role'):
-                    raise ValueError('请选择具体人物或仅角色称呼。')
-                profile_id = entity_type + '-' + hashlib.sha256((scope + '\0' + name).encode()).hexdigest()[:16]
-                profile = profiles.get(profile_id) or {
-                    'id': profile_id, 'entity_type': entity_type, 'name': name,
-                    'scope': scope, 'role_title': role, 'aliases': [],
-                    'confirmation': ({'page': '用户在本地说话人复核页明确填写并保存：', 'html': '用户在纪要网页中修改并确认：'}.get(via, '用户在对话中明确确认：')) + mapping['key']}
-                new_profiles.append(profile)
-            resolved.append((mapping['key'], profile))
-        for key, profile in resolved:
-            speaker = speakers[key]
-            if profile is None:
-                speaker.update(role_name=minutes_html.UNKNOWN_ROLE, display_name=None, identity_group=None, accepted_unknown=True)
-            else:
-                speaker.update(role_name=profile['name'] + ('｜' + profile['role_title'] if profile.get('role_title') else ''),
-                               display_name=profile['name'], identity_group=profile['id'], accepted_unknown=False)
-            speaker['role_confirmed'] = True
-            speaker['role_source'] = 'user'
-        updated_analysis = None
-        if via == 'html':
-            updated_analysis = sync_reader_names(root, state, old_speakers, [key for key, profile in resolved if profile is not None])
-        try:
-            validate_analysis(root, updated_analysis if updated_analysis is not None else read(root / 'analysis.json'), state=state)
-        except ValueError as error:
-            raise ValueError('角色更新与现有纪要归属冲突，尚未保存。请先修改相关负责人或提出者归属后重试：' + str(error)) from error
-        for profile in new_profiles:
-            confirmed_memory_upsert(memory_path(state), 'role', profile)
-            if profile['entity_type'] == 'person':
-                confirmed_memory_upsert(memory_path(state), 'term', {
-                    'id': 'name-' + digest([profile['scope'], profile['name']])[:16],
-                    'canonical': profile['name'], 'scope': profile['scope'], 'aliases': [],
-                    'definition': profile.get('role_title', ''),
-                    'confirmation': {'page': '用户在本地角色复核页明确选择具体人物并填写姓名。', 'html': '用户在纪要网页中修改并确认'}.get(via, '用户在对话中明确确认具体人物的姓名。')})
-        import voiceprint
-        try:
-            voiceprint.enroll_confirmed(root, state, [key for key, profile in resolved if profile is not None])
-        except (ValueError, RuntimeError, OSError, ImportError) as error:
-            state['voiceprint_enrollment_warning'] = str(error)
-        change = {'kind': 'roles_confirmed', 'speaker_keys': [m[0] for m in resolved], 'actor': 'user'}
-        if updated_analysis is not None:
+        with identity_store_transaction(state) as voice_active:
+            known = memory.read_store(memory_path(state))
+            profiles = {p['id']: p for p in known['roles'] if p.get('active', True)}
+            speakers = {s['key']: s for s in state['speakers']}
+            if not isinstance(mappings, list) or any(not isinstance(m, dict) or not isinstance(m.get('key'), str) for m in mappings) \
+                    or len({m['key'] for m in mappings}) != len(mappings):
+                raise ValueError('Invalid or duplicate speaker mappings.')
+            old_speakers = deepcopy(speakers)
+            resolved = []
+            new_profiles = []
+            reconfirmed_profiles = []
+            enrollment_keys = []
+            for mapping in mappings:
+                if mapping['key'] not in speakers:
+                    raise ValueError('Unknown speaker.')
+                if mapping.get('keep_unknown'):
+                    resolved.append((mapping['key'], None)); continue
+                if speakers[mapping['key']].get('diarization_unassigned') and mapping.get('confirm_single_speaker') is not True:
+                    # Speech the separation could not attribute may mix several people.
+                    raise ValueError('“说话人未分离”的部分可能混有多人的发言，不能直接认领成一个人。'
+                                     '确定这部分都是同一个人说的，请在复核页面勾选“这部分都是同一个人说的”'
+                                     '（在对话里确认的，映射里加 confirm_single_speaker）；否则选“明确保留身份未确认”。')
+                profile_id = mapping.get('profile_id')
+                if profile_id:
+                    if profile_id not in profiles:
+                        raise ValueError('Unknown/inactive profile.')
+                    profile = profiles[profile_id]
+                    original = old_speakers[mapping['key']]
+                    explicit = (mapping.get('confirm_identity') is True or not original.get('role_confirmed')
+                                or original.get('identity_group') != profile_id)
+                    if explicit and (profile.get('confirmed_by_user') is not True or not profile.get('confirmation')):
+                        # A current explicit selection upgrades only this legacy profile.
+                        profile = {**profile, 'confirmation': ({
+                            'page': '用户在本地说话人复核页明确选择已有档案并保存：',
+                            'html': '用户在纪要网页中明确确认已有档案：'
+                        }.get(via, '用户在对话中明确确认已有档案：')) + mapping['key']}
+                        reconfirmed_profiles.append(profile)
+                    memory.validate_entry('role', profile)
+                    if explicit:
+                        enrollment_keys.append(mapping['key'])
+                else:
+                    name = str(mapping.get('name', '')).strip()
+                    role = str(mapping.get('role_title', '')).strip()
+                    scope = str(mapping.get('scope', '')).strip() or '本次会议，组织待补'
+                    if not name or len(name) > 100 or len(role) > 200:
+                        raise ValueError('请填写姓名或角色称呼。')
+                    entity_type = mapping.get('entity_type', 'role')
+                    if entity_type not in ('person', 'role'):
+                        raise ValueError('请选择具体人物或仅角色称呼。')
+                    profile_id = entity_type + '-' + hashlib.sha256((scope + '\0' + name).encode()).hexdigest()[:16]
+                    profile = profiles.get(profile_id) or {
+                        'id': profile_id, 'entity_type': entity_type, 'name': name,
+                        'scope': scope, 'role_title': role, 'aliases': [],
+                        'confirmation': ({'page': '用户在本地说话人复核页明确填写并保存：', 'html': '用户在纪要网页中修改并确认：'}.get(via, '用户在对话中明确确认：')) + mapping['key']}
+                    new_profiles.append(profile)
+                    enrollment_keys.append(mapping['key'])
+                resolved.append((mapping['key'], profile))
+            for key, profile in resolved:
+                speaker = speakers[key]
+                if profile is None:
+                    speaker.update(role_name=minutes_html.UNKNOWN_ROLE, display_name=None, identity_group=None, accepted_unknown=True)
+                else:
+                    speaker.update(role_name=profile['name'] + ('｜' + profile['role_title'] if profile.get('role_title') else ''),
+                                   display_name=profile['name'], identity_group=profile['id'], accepted_unknown=False)
+                speaker['role_confirmed'] = True
+                speaker['role_source'] = 'user'
+            # Identity changes must update authored prose regardless of confirmation entry point.
+            # Include keep_unknown: withdrawing an identity must not leave publishable named prose.
+            updated_analysis = sync_reader_names(root, state, old_speakers, [key for key, _ in resolved])
+            try:
+                validate_analysis(root, updated_analysis if updated_analysis is not None else read(root / 'analysis.json'), state=state)
+            except ValueError as error:
+                raise ValueError('角色更新与现有纪要归属冲突，尚未保存。请先修改相关负责人或提出者归属后重试：' + str(error)) from error
+            for profile in {p['id']: p for p in reconfirmed_profiles}.values():
+                confirmed_memory_upsert(memory_path(state), 'role', profile, _lock_held=True)
+            for profile in new_profiles:
+                confirmed_memory_upsert(memory_path(state), 'role', profile, _lock_held=True)
+                if profile['entity_type'] == 'person':
+                    confirmed_memory_upsert(memory_path(state), 'term', {
+                        'id': 'name-' + digest([profile['scope'], profile['name']])[:16],
+                        'canonical': profile['name'], 'scope': profile['scope'], 'aliases': [],
+                        'definition': profile.get('role_title', ''),
+                        'confirmation': {'page': '用户在本地角色复核页明确选择具体人物并填写姓名。', 'html': '用户在纪要网页中修改并确认'}.get(via, '用户在对话中明确确认具体人物的姓名。')}, _lock_held=True)
+            import voiceprint
+            changed_keys = [key for key, _ in resolved if any(
+                (old_speakers[key].get(field) if field == 'identity_group' else bool(old_speakers[key].get(field))) !=
+                (speakers[key].get(field) if field == 'identity_group' else bool(speakers[key].get(field)))
+                for field in ('identity_group', 'role_confirmed', 'accepted_unknown'))]
+            state.pop('voiceprint_enrollment_warning', None)
+            try:
+                if voice_active:
+                    voiceprint.enroll_confirmed(root, state, enrollment_keys,
+                                                _lock_held=True, _reconcile_keys=changed_keys)
+            except voiceprint.ReconciliationError:
+                raise  # A failed withdrawal must never be reported as saved.
+            except (ValueError, RuntimeError, OSError, ImportError) as error:
+                state['voiceprint_enrollment_warning'] = str(error)
+            change = {'kind': 'roles_confirmed', 'speaker_keys': [m[0] for m in resolved], 'actor': 'user'}
             return commit_analysis(root, state, change, updated_analysis)
-        return commit(root, state, change)
-
 
 def sync_reader_names(root, state, old_speakers, keys):
     """Apply the same conservative single-pass rename as HTML; withhold unsafe stale prose."""
@@ -945,7 +995,7 @@ def main():
                 result = audit.report(args.workspace)
         else: result = export(Path(args.workspace))
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as exc:
+    except (ValueError, OSError, KeyError) as exc:
         parser.exit(2, str(exc) + '\n')
 
 

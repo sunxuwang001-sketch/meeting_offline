@@ -50,6 +50,63 @@ class FactTests(unittest.TestCase):
         self.assertEqual(audit.facts('一百多万，五六十万，1万5，二零二六年'),
                          {('number', '1000000'), ('number', '500000'), ('number', '600000'), ('number', '15000'), ('year', '2026')})
 
+    def test_explicit_times_preserve_period_and_24_hour_boundaries(self):
+        equivalent = [
+            ('上午三点', '03:00'), ('下午三点', '15:00'), ('3:00', '03:00'),
+            ('下午3:30', '15:30'), ('早上三点半', '03:30'),
+            ('中午十二点', '12:00'), ('中午一点', '13:00'),
+            ('凌晨十二点', '00:00'), ('凌晨三点', '03:00'),
+            ('晚上十二点', '00:00'), ('晚上九点', '21:00'),
+            ('傍晚六点', '18:00'), ('上午十二点', '12:00'),
+            ('十三点', '13:00'), ('二十四点', '24:00'),
+            ('零点半', '00:30'), ('下午15:00', '15:00'),
+        ]
+        for spoken, clock in equivalent:
+            with self.subTest(spoken=spoken):
+                self.assertEqual(audit.facts(spoken), audit.facts(clock))
+                self.assertEqual(audit.check_claim('m', 'x', clock, [0], [spoken]), [])
+                self.assertEqual(audit.check_claim('m', 'x', spoken, [0], [clock]), [])
+        different = [('上午三点', '下午三点'), ('03:00', '15:00'),
+                     ('中午十二点', '凌晨十二点'), ('上午3:30', '下午3:30'),
+                     ('24:00', '00:00'), ('下午三点', '上午三点')]
+        for claim, said in different:
+            with self.subTest(claim=claim, said=said):
+                self.assertEqual([p['kind'] for p in audit.check_claim('m', 'x', claim, [0], [said])], ['fact'])
+
+    def test_unspecified_spoken_time_cannot_establish_a_period_or_use_an_unrelated_number(self):
+        self.assertEqual(audit.facts('三点半'), {('time_ambiguous', '3:30')})
+        self.assertEqual(audit.facts('十二点半'), {('time_ambiguous', '12:30')})
+        for claim, said in [('15:30', '三点半'), ('03:30', '三点半'),
+                            ('12:30', '十二点半'), ('00:30', '十二点半'),
+                            ('15:00', '三点交付'), ('03:00', '三点交付'),
+                            ('15:00', '预算3元'), ('预算3元', '下午三点')]:
+            with self.subTest(claim=claim, said=said):
+                self.assertTrue(audit.check_claim('m', 'x', claim, [0], [said]))
+        # Omitting the period does not invent a conflicting one. Bare 三点 may
+        # mean three suggestions, so it stays numeric and can be explained manually.
+        for said in ('15:30', '03:30', '三点半'):
+            self.assertEqual(audit.check_claim('m', 'x', '三点半', [0], [said]), [])
+        self.assertEqual(audit.facts('三点建议'), {('number', '3')})
+        self.assertEqual(audit.facts('三点交付'), {('time_ambiguous', '3:00')})
+        self.assertEqual(audit.check_claim('m', 'x', '三点交付', [0], ['下午三点交付']), [])
+        self.assertEqual(audit.check_claim('m', 'x', '三点交付', [0], ['上午三点交付']), [])
+        for hour, minute in [(25, 0), (24, 1), (3, 60), (-1, 0)]:
+            self.assertIsNone(audit.time_fact(hour, minute))
+
+    def test_issue_fingerprints_bind_all_corrected_evidence_not_unrelated_segments(self):
+        cases = [('199元', '预算229元', {}, 'fact'),
+                 ('陈思远负责', '讨论任务', {'names': ['陈思远']}, 'name'),
+                 ('允许延期', '不允许延期', {}, 'negation'),
+                 ('方案通过', '再考虑方案', {'status': 'decided'}, 'status')]
+        for claim, said, options, kind in cases:
+            with self.subTest(kind=kind):
+                original = audit.check_claim('m', 'x', claim, [0], [said, '无关'], **options)[0]
+                same = audit.check_claim('m', 'x', claim, [0], [said, '修改无关片段'], **options)[0]
+                changed = audit.check_claim('m', 'x', claim, [0], [said + '。', '无关'], **options)[0]
+                self.assertEqual(original['kind'], kind)
+                self.assertEqual(original['id'], same['id'])
+                self.assertNotEqual(original['id'], changed['id'])
+
 
 class AuditFlowTests(unittest.TestCase):
     def setUp(self):
@@ -212,6 +269,43 @@ class AuditFlowTests(unittest.TestCase):
         self.assertEqual(issues[0]['where'], 'actions[0].deadline')
         with self.assertRaisesRegex(ValueError, 'user_confirmed'):
             audit.resolve(self.root, {issues[0]['id']: {'resolution': 'supported', 'note': 'AI认为可以延期'}}, self.revision())
+
+    def test_corrected_evidence_invalidates_old_supported_but_unchanged_evidence_carries_over(self):
+        issues = self.set_claim('预算199元。', '预算229元，其中税费30元。')
+        key = issues[0]['id']
+        audit.resolve(self.root, {key: {'resolution': 'supported', 'note': '229元减去30元税费为199元。'}}, self.revision())
+        self.assertTrue(audit.is_checked(self.root))
+        w.publish(self.root)
+        # An unrelated export change does not discard an evidence-bound explanation.
+        w.save_roles(self.root, [{'key': 'm-B', 'name': '陈思远', 'role_title': '财务',
+                                'entity_type': 'person', 'scope': '测试'}], self.revision())
+        self.assertEqual(audit.report(self.root)['issues'][0]['id'], key)
+        self.assertEqual(audit.resolve(self.root, {}, self.revision())['status'], 'checked')
+        # Normal supported correction path, same claim and same reference index.
+        w.add_term(self.root, {'source_id': 'm', 'heard': '229', 'canonical': '329', 'scope': '测试'}, self.revision())
+        latest = audit.report(self.root)
+        self.assertEqual(latest['unresolved'], 1)
+        self.assertNotEqual(latest['issues'][0]['id'], key)
+        self.assertEqual(latest['issues'][0]['evidence_texts'], ['预算329元，其中税费30元。'])
+        self.assertFalse(audit.is_checked(self.root))
+        with self.assertRaisesRegex(ValueError, '不存在'):
+            audit.resolve(self.root, {key: {'resolution': 'supported', 'note': '旧说明'}}, self.revision())
+        record = audit.resolve(self.root, {}, self.revision())
+        self.assertEqual(record['status'], 'pending')
+        self.assertNotIn(key, record['resolutions'])
+        with self.assertRaisesRegex(ValueError, '还没核对完'):
+            w.publish(self.root)
+
+    def test_am_pm_deadline_conflict_blocks_publication_until_explained(self):
+        issues = self.set_claim('下午三点交付', '上午三点交付', deadline=True)
+        self.assertEqual([p['kind'] for p in issues], ['deadline'])
+        self.assertFalse(audit.is_checked(self.root))
+        with self.assertRaisesRegex(ValueError, '还没核对完'):
+            w.publish(self.root)
+        # Keep the requested manual explanation policy; do not mechanically judge it.
+        record = audit.resolve(self.root, {issues[0]['id']: {'resolution': 'supported',
+                               'note': '已复核上下文，原话时段口误，采用下午交付。'}}, self.revision())
+        self.assertEqual(record['status'], 'checked')
 
     def test_legacy_fact_supported_remains_checked_with_explanation(self):
         issues = self.set_claim('年度预算12万元。', '每月预算一万元。')
