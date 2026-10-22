@@ -69,6 +69,19 @@ class IdentityReviewFollowupTests(unittest.TestCase):
         self.assertTrue(profile['confirmed_by_user'])
         self.assertTrue(profile['confirmation'])
 
+    def test_unchanged_chat_card_with_incomplete_legacy_profile_still_saves(self):
+        memory = w.read(self.store); memory['roles'][0].pop('confirmation'); w.write(self.store, memory)
+        before = self.store.read_bytes()
+        with patch.object(v, 'speaker_vectors', side_effect=AssertionError('no consent')):
+            self.save([{'key': 'm-A', 'profile_id': 'person-a'}])
+        self.assertEqual(self.store.read_bytes(), before)
+        self.assertFalse(v.location().exists())
+
+    def test_explicit_card_with_incomplete_legacy_profile_explains_in_chinese(self):
+        memory = w.read(self.store); memory['roles'][0].pop('scope'); w.write(self.store, memory)
+        with self.assertRaisesRegex(ValueError, '记录不完整'):
+            self.save([{'key': 'm-A', 'profile_id': 'person-a', 'confirm_identity': True}])
+
     def test_malformed_legacy_revision_returns_http400(self):
         for value in ('old', None, True, 0):
             with self.subTest(value=value):

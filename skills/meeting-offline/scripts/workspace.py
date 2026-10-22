@@ -328,9 +328,16 @@ def save_roles(root, mappings, expected, via='page'):
                             'html': '用户在纪要网页中明确确认已有档案：'
                         }.get(via, '用户在对话中明确确认已有档案：')) + mapping['key']}
                         reconfirmed_profiles.append(profile)
-                    memory.validate_entry('role', profile)
                     if explicit:
+                        # Only an upgraded or newly chosen profile is written back; check it first.
+                        try:
+                            memory.validate_entry('role', profile)
+                        except ValueError as error:
+                            raise ValueError(f'已有档案“{profile.get("name", profile_id)}”的记录不完整（{error}），'
+                                             '不能用来确认身份。请改为填写新的姓名，或先修好这条档案。') from error
                         enrollment_keys.append(mapping['key'])
+                    elif not isinstance(profile.get('name'), str) or not profile['name'].strip():
+                        raise ValueError(f'已有档案 {profile_id} 缺少姓名；请勾选确认后重新填写这位说话人。')
                 else:
                     name = str(mapping.get('name', '')).strip()
                     role = str(mapping.get('role_title', '')).strip()
